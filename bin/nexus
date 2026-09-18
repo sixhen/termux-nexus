@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# termux-nexus - Lightweight system diagnostics & environment tuner for Android Termux
+# Author: sixhen <dmh190229@gmail.com>
+# License: MIT
+
+set -eo pipefail
+
+VERSION="1.2.0"
+
+# ANSI Colors
+C_RESET="\033[0m"
+C_BOLD="\033[1m"
+C_RED="\033[38;5;196m"
+C_GREEN="\033[38;5;48m"
+C_YELLOW="\033[38;5;220m"
+C_BLUE="\033[38;5;39m"
+C_PURPLE="\033[38;5;141m"
+C_GRAY="\033[38;5;240m"
+
+log_info()    { printf "${C_BLUE}::${C_RESET} %s\n" "$*"; }
+log_ok()      { printf "${C_GREEN}✓${C_RESET} %s\n" "$*"; }
+log_warn()    { printf "${C_YELLOW}!${C_RESET} %s\n" "$*"; }
+log_error()   { printf "${C_RED}✗${C_RESET} %s\n" "$*" >&2; }
+
+banner() {
+    printf "${C_PURPLE}${C_BOLD}"
+    cat << "EOF"
+  _  _ _____  ___   _ ___ 
+ | \| | __\ \/ / | | / __|
+ | .` | _| >  <| |_| \__ \
+ |_|\_|___/_/\_\\___/|___/
+EOF
+    printf "${C_RESET}${C_GRAY}  termux-nexus v%s · by sixhen${C_RESET}\n\n" "$VERSION"
+}
+
+usage() {
+    banner
+    printf "${C_BOLD}USAGE:${C_RESET}\n"
+    printf "  nexus <command> [options]\n\n"
+    printf "${C_BOLD}COMMANDS:${C_RESET}\n"
+    printf "  ${C_GREEN}doctor${C_RESET}     Inspect system state, architecture, memory, battery & mirror latency\n"
+    printf "  ${C_GREEN}speedtest${C_RESET}  Benchmark and rank top Termux package mirrors\n"
+    printf "  ${C_GREEN}clean${C_RESET}      Purge apt cache, clean temporary files and vacuum storage\n"
+    printf "  ${C_GREEN}backup${C_RESET}     Create a compressed archive of Termux home configuration\n"
+    printf "  ${C_GREEN}info${C_RESET}       Display hardware, kernel, and package count overview\n"
+    printf "  ${C_GREEN}version${C_RESET}    Show nexus version\n"
+    printf "  ${C_GREEN}help${C_RESET}       Display this help screen\n\n"
+    printf "${C_BOLD}EXAMPLES:${C_RESET}\n"
+    printf "  nexus doctor\n"
+    printf "  nexus clean\n"
+    printf "  nexus backup ~/termux-backup.tar.gz\n"
+}
+
+cmd_info() {
+    local os_arch kernel_ver pkg_count uptime_str
+    os_arch="$(uname -m)"
+    kernel_ver="$(uname -r)"
+    uptime_str="$(uptime -p 2>/dev/null || uptime | awk -F',' '{print $1}')"
+    pkg_count="$(dpkg -l 2>/dev/null | grep -c '^ii' || echo 'N/A')"
+
+    banner
+    printf "${C_BOLD}SYSTEM DETAILS:${C_RESET}\n"
+    printf "  %-14s %s\n" "Architecture:" "${C_BLUE}${os_arch}${C_RESET}"
+    printf "  %-14s %s\n" "Kernel:" "${kernel_ver}"
+    printf "  %-14s %s\n" "Uptime:" "${uptime_str}"
+    printf "  %-14s %s\n" "Packages:" "${pkg_count} installed"
+    printf "  %-14s %s\n" "Prefix:" "${PREFIX:-/data/data/com.termux/files/usr}"
+    printf "\n"
+}
+
+cmd_doctor() {
+    banner
+    log_info "Running Termux health diagnostics..."
+    printf "\n"
+
+    # 1. Architecture Check
+    local arch
+    arch="$(uname -m)"
+    if [[ "$arch" == "aarch64" ]]; then
+        log_ok "Architecture: $arch (64-bit ARM - optimal)"
+    else
+        log_warn "Architecture: $arch (32-bit or non-standard)"
+    fi
+
+    # 2. Storage Check
+    local free_space
+    free_space="$(df -h "$HOME" 2>/dev/null | awk 'NR==2 {print $4}' || echo 'N/A')"
+    log_ok "Available Storage ($HOME): $free_space"
+
+    # 3. Memory & Swap
+    if [[ -f /proc/meminfo ]]; then
+        local mem_avail
+        mem_avail="$(awk '/MemAvailable/ {printf "%.1f GB", $2/1024/1024}' /proc/meminfo)"
+        log_ok "Memory Available: $mem_avail"
+    fi
+
+    # 4. Battery state (Termux API fallback)
+    if command -v termux-battery-status >/dev/null 2>&1; then
+        local b_pct b_stat
+        b_pct="$(termux-battery-status | grep -o '"percentage": [0-9]*' | awk '{print $2}')"
+        b_stat="$(termux-battery-status | grep -o '"status": "[^"]*"' | cut -d'"' -f4)"
+        log_ok "Battery: ${b_pct}% (${b_stat})"
+    fi
+
+    # 5. Core tools check
+    local missing=()
+    for tool in git curl python nodejs zsh; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            missing+=("$tool")
+        fi
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        log_ok "Essential toolchain installed (git, curl, python, nodejs, zsh)"
+    else
+        log_warn "Missing optional packages: ${missing[*]}"
+        printf "  ${C_GRAY}Run: pkg install -y ${missing[*]}${C_RESET}\n"
+    fi
+
+    # 6. Mirror Latency Test
+    log_info "Probing package mirror latency..."
+    local test_url="https://packages.termux.dev/apt/termux-main"
+    local latency
+    latency="$(curl -o /dev/null -s -w "%{time_total}\n" --connect-timeout 4 "$test_url" 2>/dev/null || echo "timeout")"
+    if [[ "$latency" == "timeout" ]]; then
+        log_warn "Official mirror timed out. Consider running: termux-change-repo"
+    else
+        log_ok "Primary mirror latency: ${latency}s"
+    fi
+
+    printf "\n${C_GREEN}${C_BOLD}Doctor check completed.${C_RESET}\n"
+}
+
+cmd_clean() {
+    banner
+    log_info "Cleaning Termux cache and orphaned packages..."
+    
+    # 1. Apt cache
+    if [[ -d "$PREFIX/var/cache/apt/archives" ]]; then
+        local count
+        count="$(find "$PREFIX/var/cache/apt/archives" -name "*.deb" | wc -l)"
+        if [[ $count -gt 0 ]]; then
+            apt-get clean 2>/dev/null || true
+            log_ok "Purged $count cached .deb packages"
+        else
+            log_ok "Apt archives already clean"
+        fi
+    fi
+
+    # 2. Temporary files
+    if [[ -d "$PREFIX/tmp" ]]; then
+        rm -rf "$PREFIX/tmp"/* 2>/dev/null || true
+        log_ok "Emptied $PREFIX/tmp"
+    fi
+
+    # 3. Pip cache if exists
+    if [[ -d "$HOME/.cache/pip" ]]; then
+        rm -rf "$HOME/.cache/pip" 2>/dev/null || true
+        log_ok "Cleaned pip cache"
+    fi
+
+    # 4. Yarn / npm cache if exists
+    if [[ -d "$HOME/.npm/_cacache" ]]; then
+        rm -rf "$HOME/.npm/_cacache" 2>/dev/null || true
+        log_ok "Cleaned npm cache"
+    fi
+
+    log_ok "System cleanup completed successfully."
+}
+
+cmd_backup() {
+    local target="${1:-$HOME/termux-backup-$(date +%Y%m%d).tar.gz}"
+    banner
+    log_info "Backing up Termux home directory..."
+    log_info "Destination: $target"
+
+    tar -czf "$target" \
+        --exclude=".cache" \
+        --exclude="node_modules" \
+        --exclude="*.tar.gz" \
+        -C "$HOME" .
+
+    local size
+    size="$(du -h "$target" | cut -f1)"
+    log_ok "Backup created: $target ($size)"
+}
+
+cmd_speedtest() {
+    banner
+    log_info "Testing Termux mirrors latency..."
+    printf "\n"
+
+    local mirrors=(
+        "https://packages.termux.dev/apt/termux-main (Default)"
+        "https://mirrors.tuna.tsinghua.edu.cn/termux/apt/termux-main (Tuna)"
+        "https://mirror.albony.in/termux/apt/termux-main (Albony)"
+        "https://termux.librehat.com/apt/termux-main (Librehat)"
+    )
+
+    for entry in "${mirrors[@]}"; do
+        local url="${entry%% *}"
+        local name="${entry#* }"
+        local time
+        time="$(curl -o /dev/null -s -w "%{time_total}" --connect-timeout 3 "$url" 2>/dev/null || echo "timeout")"
+        if [[ "$time" == "timeout" ]]; then
+            printf "  ${C_RED}TIMEOUT${C_RESET} - %s\n" "$name"
+        else
+            printf "  ${C_GREEN}%6.3fs${C_RESET} - %s\n" "$time" "$name"
+        fi
+    done
+
+    printf "\n${C_GRAY}Tip: Run 'termux-change-repo' to switch your active mirror.${C_RESET}\n"
+}
+
+# Entrypoint
+case "${1:-help}" in
+    doctor)
+        cmd_doctor
+        ;;
+    clean)
+        cmd_clean
+        ;;
+    backup)
+        cmd_backup "$2"
+        ;;
+    speedtest)
+        cmd_speedtest
+        ;;
+    info)
+        cmd_info
+        ;;
+    version|-v|--version)
+        printf "termux-nexus v%s\n" "$VERSION"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        log_error "Unknown command: '$1'"
+        printf "Run 'nexus help' for available commands.\n"
+        exit 1
+        ;;
+esac
